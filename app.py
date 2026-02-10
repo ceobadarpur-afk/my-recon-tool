@@ -1,84 +1,89 @@
 import streamlit as st
 import pandas as pd
+import io
 
-st.set_page_config(page_title="Collection Recon Tool", layout="wide")
+st.set_page_config(page_title="SDO vs BillDesk Recon", layout="wide")
 
-st.title("📑 Custom Reconciliation Portal")
-st.info("This tool matches SDO Column H (Amount) with BillDesk Column Q (Amount) using Consumer and Bill IDs.")
+st.title("⚖️ SDO vs BillDesk Detailed Reconciliation")
 
-# --- FILE UPLOADERS ---
-col1, col2, col3 = st.columns(3)
+# --- 1. UPLOADERS ---
+col1, col2 = st.columns(2)
 with col1:
-    sdo_files = st.file_uploader("Upload SDO Files (HeadWise)", accept_multiple_files=True)
+    sdo_files = st.file_uploader("Upload SDO HeadWise Files", accept_multiple_files=True)
 with col2:
-    bd_files = st.file_uploader("Upload BillDesk Reports", accept_multiple_files=True)
-with col3:
-    bank_file = st.file_uploader("Upload Bank Statement")
+    bd_files = st.file_uploader("Upload BillDesk Report Files", accept_multiple_files=True)
 
-if sdo_files and bd_files and bank_file:
+# Sidebar for Column Settings (In case BillDesk format changes)
+st.sidebar.header("BillDesk Column Settings")
+bd_cons_col = st.sidebar.number_input("BillDesk: Consumer No Column Index (A=0, B=1...)", value=0)
+bd_circle_col = st.sidebar.number_input("BillDesk: Circle Code Column Index", value=1)
+
+if sdo_files and bd_files:
     try:
-        # 1. PROCESS SDO FILES (Col B=Cons No, Col D=Bill No, Col H=Amount)
+        # --- 2. PROCESS SDO DATA ---
         sdo_list = []
         for f in sdo_files:
-            # Reading Excel - Header usually starts at row 0
             df = pd.read_excel(f)
-            # Using iloc to get columns by position: B=1, D=3, H=7
-            sub_df = df.iloc[:, [1, 3, 7]].copy()
-            sub_df.columns = ['Consumer_No', 'Bill_No', 'Amount']
-            # Create SDO Code from first 3 digits of Consumer No
-            sub_df['SDO_Code'] = sub_df['Consumer_No'].astype(str).str[:3]
-            sdo_list.append(sub_df)
+            # Col B=1 (Cons No), D=3 (Bill No), H=7 (Amount)
+            sub = df.iloc[:, [1, 3, 7]].copy()
+            sub.columns = ['Consumer_No', 'Bill_No', 'SDO_Amount']
+            sub['SDO_Code'] = sub['Consumer_No'].astype(str).str[:3]
+            sdo_list.append(sub)
         
-        master_sdo = pd.concat(sdo_list)
-        # Summing by Consumer and Bill No as per your requirement
-        sdo_grouped = master_sdo.groupby(['SDO_Code', 'Consumer_No', 'Bill_No'])['Amount'].sum().reset_index()
+        df_sdo = pd.concat(sdo_list).groupby(['Consumer_No', 'Bill_No', 'SDO_Code'])['SDO_Amount'].sum().reset_index()
+        df_sdo['Key'] = df_sdo['Consumer_No'].astype(str) + "_" + df_sdo['Bill_No'].astype(str)
 
-        # 2. PROCESS BILLDESK FILES (Col Q=Amount at index 16)
+        # --- 3. PROCESS BILLDESK DATA ---
         bd_list = []
         for f in bd_files:
             df = pd.read_excel(f)
-            # Assuming BillDesk uses similar identifiers in specific columns
-            # Adjust indices if Consumer No/Circle Code are in different positions
-            # Here we extract Amount from Column Q (index 16)
-            bd_sub = df.copy()
-            bd_sub['BD_Amount'] = bd_sub.iloc[:, 16] # Column Q
-            # We assume Col 0 or 1 contains the Consumer/Circle identifier
-            bd_sub = bd_sub.rename(columns={bd_sub.columns[0]: 'BD_Identifier'}) 
-            bd_list.append(bd_sub)
+            # Col Q = Index 16 (Amount)
+            # Use sidebar inputs for Consumer No and Circle Code
+            sub = df.copy()
+            sub['BD_Amount'] = sub.iloc[:, 16] 
+            sub['BD_Cons'] = sub.iloc[:, bd_cons_col]
+            sub['BD_Circle'] = sub.iloc[:, bd_circle_col]
+            bd_list.append(sub[['BD_Cons', 'BD_Circle', 'BD_Amount']])
         
-        master_bd = pd.concat(bd_list)
+        df_bd = pd.concat(bd_list).groupby(['BD_Cons', 'BD_Circle'])['BD_Amount'].sum().reset_index()
+        df_bd['Key'] = df_bd['BD_Cons'].astype(str) + "_" + df_bd['BD_Circle'].astype(str)
 
-        # 3. PROCESS BANK STATEMENT (INDIAIDEAS.COM)
-        bank_df = pd.read_excel(bank_file)
-        # Identify rows with INDIAIDEAS
-        bank_mask = bank_df.apply(lambda row: row.astype(str).str.contains('INDIAIDEAS', case=False).any(), axis=1)
-        bank_filtered = bank_df[bank_mask].copy()
+        # --- 4. RECONCILIATION (OUTER JOIN) ---
+        recon = pd.merge(df_sdo, df_bd, on='Key', how='outer')
+
+        # Create Status Column
+        def check_status(row):
+            if pd.isna(row['SDO_Amount']): return "Missing in SDO"
+            if pd.isna(row['BD_Amount']): return "Missing in BillDesk"
+            if row['SDO_Amount'] == row['BD_Amount']: return "Matched"
+            return "Amount Mismatch"
+
+        recon['Status'] = recon.apply(check_status, axis=1)
+        recon['Difference'] = recon['SDO_Amount'].fillna(0) - row_val = recon['BD_Amount'].fillna(0)
+
+        # --- 5. RESULTS DISPLAY ---
+        st.header("Summary Metrics")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Total SDO ₹", f"{df_sdo['SDO_Amount'].sum():,.2f}")
+        m2.metric("Total BillDesk ₹", f"{df_bd['BD_Amount'].sum():,.2f}")
+        m3.metric("Matched Records", len(recon[recon['Status'] == "Matched"]))
+        m4.metric("Discrepancies", len(recon[recon['Status'] != "Matched"]))
+
+        # Detailed Tables
+        st.subheader("Detailed Report")
+        status_filter = st.selectbox("Filter by Status:", ["All", "Matched", "Amount Mismatch", "Missing in BillDesk", "Missing in SDO"])
         
-        # --- RECONCILIATION DISPLAY ---
-        st.header("Reconciliation Results")
+        display_df = recon.copy()
+        if status_filter != "All":
+            display_df = display_df[display_df['Status'] == status_filter]
         
-        # Summary Totals
-        total_sdo = master_sdo['Amount'].sum()
-        total_bd = master_bd['BD_Amount'].sum()
-        # Find the column that looks like 'Credit' in bank statement to sum
-        bank_credit_total = bank_filtered.iloc[:, -1].sum() # Assumes last column is Amount
+        st.dataframe(display_df[['SDO_Code', 'Consumer_No', 'Bill_No', 'SDO_Amount', 'BD_Amount', 'Status', 'Difference']], use_container_width=True)
 
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Total SDO Collection", f"₹{total_sdo:,.2f}")
-        m2.metric("Total BillDesk Report", f"₹{total_bd:,.2f}")
-        m3.metric("Bank Credit (INDIAIDEAS)", f"₹{bank_credit_total:,.2f}")
-
-        # Show Discrepancies
-        if total_sdo != total_bd:
-            st.error(f"⚠️ Discrepancy Found! Difference: ₹{abs(total_sdo - total_bd):,.2f}")
-        else:
-            st.success("✅ SDO and BillDesk Totals Match!")
-
-        st.subheader("SDO-wise Summary")
-        sdo_summary = master_sdo.groupby('SDO_Code')['Amount'].sum().reset_index()
-        st.table(sdo_summary)
+        # Download Report
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            recon.to_excel(writer, index=False, sheet_name='Recon_Report')
+        st.download_button("📥 Download Full Recon Report (Excel)", output.getvalue(), "Detailed_Recon.xlsx")
 
     except Exception as e:
-        st.error(f"Data Error: {e}. Check if the columns match the positions (B, D, H, Q).")
-else:
-    st.info("Please upload all files to generate the reconciliation report.")
+        st.error(f"Error: {e}. Please check your column indices.")
