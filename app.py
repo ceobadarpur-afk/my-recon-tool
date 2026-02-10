@@ -59,8 +59,8 @@ if sdo_files and bd_files:
             return "Amount Mismatch"
 
         recon['Status'] = recon.apply(check_status, axis=1)
-        recon['Difference'] = recon['SDO_Amount'].fillna(0) - row_val = recon['BD_Amount'].fillna(0)
-
+       row_val = recon['BD_Amount'].fillna(0)
+       recon['Difference'] = recon['SDO_Amount'].fillna(0) - row_val
         # --- 5. RESULTS DISPLAY ---
         st.header("Summary Metrics")
         m1, m2, m3, m4 = st.columns(4)
@@ -87,3 +87,4 @@ if sdo_files and bd_files:
 
     except Exception as e:
         st.error(f"Error: {e}. Please check your column indices.")
+
